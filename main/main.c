@@ -13,16 +13,18 @@ static const char *TAG = "APP_MAIN";
 
 #define ACTION_GPIO 2
 
+// 測試用的 Callback：閃爍 LED
 static void IRAM_ATTR led_blink_action(void) {
     static int level = 0;
     gpio_set_level(ACTION_GPIO, level = !level);
-    // 這裡可以加上 player 的其他邏輯
+    // 這裡通常是 Player Task 的通知入口
+    // 例如：xTaskNotifyFromISR(player_task_handle, ...);
 }
 
 void app_main(void) {
     nvs_flash_init();
     
-    // 初始化 GPIO (測試用)
+    // 初始化 GPIO (測試 Action 觸發用)
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << ACTION_GPIO),
         .mode = GPIO_MODE_OUTPUT,
@@ -33,21 +35,23 @@ void app_main(void) {
 
     // 1. 初始化接收器
     bt_receiver_config_t rx_cfg = {
-        .feedback_gpio_num = -1,    // 關閉底層 Debug GPIO
+        .feedback_gpio_num = -1,    // 關閉底層 GPIO (若想用示波器看收包訊號可填入 GPIO 號碼)
         .manufacturer_id = 0xFFFF,  // 目標廠商 ID
-        .sync_window_us = 1000000,    // us
+        .my_player_id = 1,          
+        .sync_window_us = 500000,    // 500ms
         .queue_size = 20
     };
     bt_receiver_init(&rx_cfg);
 
     // 2. 啟動
     bt_receiver_start();
-    ESP_LOGI(TAG, "System Started. Waiting for signals...");
+    ESP_LOGI(TAG, "System Started. I am Player #%d.", rx_cfg.my_player_id);
 
     // 3. 註冊動作
+    // 設定當 Target Time 到達時，要執行什麼動作
     bt_receiver_register_callback(led_blink_action);
 
-    // 讓 Main Loop 活著
+    // 讓 Main Loop 保持活躍
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
     }

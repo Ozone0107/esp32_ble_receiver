@@ -1,0 +1,121 @@
+//referee
+#include <stdio.h>
+#include <math.h> // 用於 abs
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "nvs_flash.h"
+#include "driver/gpio.h"
+#include "esp_log.h"
+#include "esp_rom_sys.h"
+#include "esp_timer.h" // 用於高精度計時
+
+// 引用我們的同步 API
+#include "bt_receiver.h"
+
+static const char *TAG = "APP_MAIN";
+
+#define ACTION_GPIO 2      // 我自己的輸出 (接 LED)
+#define MEASURE_GPIO 4     // 測量別人的輸入 (接另一塊板子的 GPIO 2)
+
+// 用來記錄時間戳記 (使用 volatile 因為會在 ISR 修改)
+static volatile int64_t t_self_trigger = 0;
+static volatile int64_t t_peer_trigger = 0;
+static volatile bool new_measurement_ready = false;
+
+// --- ISR: 偵測到另一塊板子 (Peer) 拉高時觸發 ---
+static void IRAM_ATTR peer_signal_isr(void *arg) {
+    // 只有當還沒記錄到時才記錄 (避免彈跳或是重複觸發)
+    if (t_peer_trigger == 0) {
+        t_peer_trigger = esp_timer_get_time();
+    }
+}
+
+// --- Callback: 我自己的時間到了 ---
+static void IRAM_ATTR my_action_callback(void) {
+    // 1. 馬上紀錄時間
+    t_self_trigger = esp_timer_get_time();
+
+    // 2. 執行動作 (拉高 GPIO，讓 LED 亮，同時也讓測量端偵測)
+    gpio_set_level(ACTION_GPIO, 1);
+    
+    // 亮 50ms 方便肉眼看，也確保對方能偵測到 High
+    esp_rom_delay_us(50000); 
+    
+    gpio_set_level(ACTION_GPIO, 0);
+}
+
+void app_main(void) {
+    nvs_flash_init();
+    
+    // --- 1. 設定 ACTION_GPIO (輸出) ---
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << ACTION_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_down_en = 0, .pull_up_en = 0, .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&io_conf);
+    gpio_set_level(ACTION_GPIO, 0);
+
+    // --- 2. 設定 MEASURE_GPIO (輸入，監聽對方) ---
+    io_conf.pin_bit_mask = (1ULL << MEASURE_GPIO);
+    io_conf.mode = GPIO_MODE_INPUT;
+    io_conf.pull_down_en = 1; // 下拉電阻，預設為 Low
+    io_conf.intr_type = GPIO_INTR_POSEDGE; // 上升緣觸發 (Low -> High)
+    gpio_config(&io_conf);
+
+    // 安裝 ISR 服務
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(MEASURE_GPIO, peer_signal_isr, NULL);
+
+    // --- 3. 初始化接收器 ---
+    bt_receiver_config_t rx_cfg = {
+        .feedback_gpio_num = -1,
+        .manufacturer_id = 0xFFFF,
+        .my_player_id = 5,       // 假設兩台都設一樣的 ID (或者都設 -1) 才會同時觸發
+        .sync_window_us = 50000, 
+        .queue_size = 20
+    };
+    bt_receiver_init(&rx_cfg);
+    bt_receiver_start();
+    
+    ESP_LOGI(TAG, "Referee Mode Started. Listening on GPIO %d...", MEASURE_GPIO);
+
+    // 註冊動作
+    bt_receiver_register_callback(my_action_callback);
+
+    while (1) {
+        // 檢查是否兩者都觸發了
+        if (t_self_trigger != 0 && t_peer_trigger != 0) {
+            
+            // 計算誤差
+            int64_t diff = t_peer_trigger - t_self_trigger;
+            
+            ESP_LOGI(TAG, "--- Sync Result ---");
+            ESP_LOGI(TAG, "My Time:   %lld", t_self_trigger);
+            ESP_LOGI(TAG, "Peer Time: %lld", t_peer_trigger);
+            
+            if (diff > 0) {
+                ESP_LOGW(TAG, "Peer was SLOWER by %lld us", diff);
+            } else if (diff < 0) {
+                ESP_LOGW(TAG, "Peer was FASTER by %lld us", -diff);
+            } else {
+                ESP_LOGI(TAG, "PERFECT SYNC (0 us)!");
+            }
+            
+            // 重置，準備下一次測試
+            // 稍微延遲一下以免讀到殘留訊號
+            vTaskDelay(pdMS_TO_TICKS(100)); 
+            t_self_trigger = 0;
+            t_peer_trigger = 0;
+        }
+        
+        // 如果超時太久 (例如我自己觸發了，但對方沒反應)，也可以做重置
+        if (t_self_trigger != 0 && (esp_timer_get_time() - t_self_trigger > 2000000)) {
+            ESP_LOGE(TAG, "Timeout! Peer signal not received.");
+            t_self_trigger = 0;
+            t_peer_trigger = 0;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}

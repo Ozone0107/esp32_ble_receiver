@@ -1,6 +1,10 @@
 /*
  * bt_receiver.c
+ * 整合了 HCI Driver, Fast Parsing, Sync Logic
+ * * 對應 Sender 結構:
+ * [Type(1)][ID(2)][CMD(1)][Mask(8)][Delay(4)] = Total 16 bytes
  */
+
 #include "bt_receiver.h"
 #include <string.h>
 #include <stdio.h>
@@ -13,7 +17,7 @@
 #include "driver/gpio.h"
 #include "esp_timer.h"
 
-// --- HCI Macros & Constants (原 bt_hci_common.h) ---
+// --- HCI Macros & Constants (Internal) ---
 #define HCI_H4_CMD_PREAMBLE_SIZE           (4)
 #define HCI_GRP_HOST_CONT_BASEBAND_CMDS    (0x03 << 10)
 #define HCI_GRP_BLE_CMDS                   (0x08 << 10)
@@ -32,12 +36,13 @@
 enum { H4_TYPE_COMMAND = 1, H4_TYPE_ACL = 2, H4_TYPE_SCO = 3, H4_TYPE_EVENT = 4 };
 
 // --- 內部資料結構 ---
-typedef struct {
-    uint8_t cmd_type;
-    uint32_t delay_val;
-    int8_t rssi;
-    int64_t rx_time_us; 
-} ble_rx_packet_t;
+// typedef struct {
+//     uint8_t cmd_type;
+//     uint64_t target_mask;
+//     uint32_t delay_val;
+//     int8_t rssi;
+//     int64_t rx_time_us; 
+// } ble_rx_packet_t;
 
 static const char *TAG = "BT_RECEIVER";
 
@@ -115,39 +120,66 @@ static void IRAM_ATTR fast_parse_and_trigger(uint8_t *data, uint16_t len) {
             if (ad_len == 0) break;
             uint8_t ad_type = adv_data[offset++];
 
-            if (ad_type == 0xFF && ad_len >= 7) {
+            // [修改] 長度檢查：
+            // Type(1) + ID(2) + CMD(1) + Mask(8) + Delay(4) = 16 bytes
+            // ad_len 包含 Type 欄位本身(1) + Data(15) = 16
+            if (ad_type == 0xFF && ad_len >= 16) {
                 uint16_t target_id = s_config.manufacturer_id;
-                // Check Manufacturer ID
+                
+                // 檢查 Manufacturer ID (Offset 0, 1) - Little Endian in Packet
                 if (adv_data[offset] == (target_id & 0xFF) && 
                     adv_data[offset+1] == ((target_id >> 8) & 0xFF)) {
                     
-                    // Hardware Trigger (Optional Debug)
-                    if (s_config.feedback_gpio_num >= 0) {
-                        gpio_set_level(s_config.feedback_gpio_num, 1);
-                        esp_rom_delay_us(1);
-                        gpio_set_level(s_config.feedback_gpio_num, 0);
+                    // [新增] 解析 8-byte Target Mask (Offset 3 ~ 10)
+                    // Sender 寫入順序是 Little Endian (Byte 0 ... Byte 7)
+                    uint64_t rcv_mask = 0;
+                    for(int k=0; k<8; k++) {
+                        rcv_mask |= ((uint64_t)adv_data[offset + 3 + k] << (k*8));
                     }
 
-                    // Extract Data
-                    uint8_t rcv_cmd = adv_data[offset+2];
-                    uint32_t rcv_delay = (adv_data[offset+3] << 24) |
-                                         (adv_data[offset+4] << 16) |
-                                         (adv_data[offset+5] << 8)  |
-                                         (adv_data[offset+6]);
-
-                    ble_rx_packet_t pkt;
-                    pkt.cmd_type = rcv_cmd;
-                    pkt.delay_val = rcv_delay;
-                    pkt.rssi = rssi;
-                    pkt.rx_time_us = now_us;
-
-                    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-                    xQueueSendFromISR(s_adv_queue, &pkt, &xHigherPriorityTaskWoken);
-                    if (xHigherPriorityTaskWoken) {
-                        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+                    // [新增] 檢查我是否在目標名單中
+                    bool is_target = true;
+                    if (s_config.my_player_id >= 0) {
+                        // 檢查 Mask 對應 bit 是否為 1
+                        if (!((rcv_mask >> s_config.my_player_id) & 1ULL)) {
+                            is_target = false;
+                        }
                     }
-                    
-                    return; 
+
+                    if (is_target) {
+                        // Hardware Trigger (GPIO Debug) - 符合資格才觸發
+                        if (s_config.feedback_gpio_num >= 0) {
+                            gpio_set_level(s_config.feedback_gpio_num, 1);
+                            esp_rom_delay_us(1);
+                            gpio_set_level(s_config.feedback_gpio_num, 0);
+                        }
+
+                        // [修改] 解析 CMD (Offset 2)
+                        uint8_t rcv_cmd = adv_data[offset+2];
+
+                        // [修改] 解析 Delay (Offset 11 ~ 14) - Big Endian
+                        uint32_t rcv_delay = (adv_data[offset+11] << 24) |
+                                             (adv_data[offset+12] << 16) |
+                                             (adv_data[offset+13] << 8)  |
+                                             (adv_data[offset+14]);
+
+                        ble_rx_packet_t pkt;
+                        pkt.cmd_type = rcv_cmd;
+                        pkt.target_mask = rcv_mask;
+                        pkt.delay_val = rcv_delay;
+                        pkt.rssi = rssi;
+                        pkt.rx_time_us = now_us;
+
+                        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+                        xQueueSendFromISR(s_adv_queue, &pkt, &xHigherPriorityTaskWoken);
+                        
+                        // 正確的 portYIELD_FROM_ISR 用法
+                        if (xHigherPriorityTaskWoken) {
+                            portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+                        }
+                        
+                        return; // 找到並處理完畢，跳出
+                    }
                 }
             }
             offset += (ad_len - 1);
