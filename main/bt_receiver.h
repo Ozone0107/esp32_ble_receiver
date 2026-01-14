@@ -8,7 +8,8 @@
 extern "C" {
 #endif
 
-typedef void (*bt_receiver_callback_t)(void);
+//typedef void (*bt_receiver_callback_t)(void);
+typedef void (*bt_receiver_callback_t)(uint8_t cmd);
 
 // --- [修改] 接收到的封包結構 ---
 typedef struct {

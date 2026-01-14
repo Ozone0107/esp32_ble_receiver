@@ -54,6 +54,7 @@ static TaskHandle_t s_task_handle = NULL;
 static bool s_is_running = false;
 static uint8_t hci_cmd_buf[128];
 static volatile bt_receiver_callback_t s_registered_callback = NULL;
+static volatile uint8_t s_pending_cmd = 0;
 
 // ==========================================
 // Part 1: HCI Helper Functions (Private)
@@ -202,7 +203,7 @@ static esp_vhci_host_callback_t vhci_host_cb = { controller_rcv_pkt_ready, host_
 
 static void IRAM_ATTR timer_timeout_cb(void *arg) {
     if (s_registered_callback) {
-        s_registered_callback();
+        s_registered_callback(s_pending_cmd);
     }
 }
 
@@ -253,6 +254,7 @@ static void sync_process_task(void *arg) {
                     int64_t wait_us = final_target - now;
 
                     if (wait_us > 500) {
+                        s_pending_cmd = current_cmd;
                         esp_timer_start_once(s_action_timer, wait_us);
                         
                         ESP_LOGI(TAG, "CMD 0x%02X Locked! Count: %d | Target: %lld | Action in: %lld us", 

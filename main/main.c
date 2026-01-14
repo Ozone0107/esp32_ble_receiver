@@ -12,7 +12,36 @@
 static const char *TAG = "APP_MAIN";
 
 #define ACTION_GPIO 2
+#define STATE_RESET   0x01
+#define STATE_READY   0x02
+#define STATE_PLAY    0x03
+#define STATE_TEST    0x04
+#define STATE_PAUSE   0x05
 
+static void IRAM_ATTR state_action_callback(uint8_t cmd) {
+    
+    // 使用 switch-case 判斷收到什麼，並印出對應訊息
+    switch (cmd) {
+        case STATE_RESET:
+            ESP_LOGI(TAG, ">>> [收到指令] RESET");
+            break;
+        case STATE_READY:
+            ESP_LOGI(TAG, ">>> [收到指令] READY");
+            break;
+        case STATE_PLAY:
+            ESP_LOGI(TAG, ">>> [收到指令] PLAY");
+            break;
+        case STATE_TEST:
+            ESP_LOGI(TAG, ">>> [收到指令] TEST");
+            break;
+        case STATE_PAUSE:
+            ESP_LOGI(TAG, ">>> [收到指令] PAUSE");
+            break;
+        default:
+            ESP_LOGE(TAG, ">>> [未知指令] ID: 0x%02X", cmd);
+            break;
+    }
+}
 // 測試用的 Callback：閃爍 LED
 static void IRAM_ATTR led_blink_action(void) {
     static int level = 0;
@@ -49,7 +78,7 @@ void app_main(void) {
 
     // 3. 註冊動作
     // 設定當 Target Time 到達時，要執行什麼動作
-    bt_receiver_register_callback(led_blink_action);
+    bt_receiver_register_callback(state_action_callback);
 
     // 讓 Main Loop 保持活躍
     while (1) {
