@@ -1,9 +1,3 @@
-/*
- * bt_receiver.c
- * 整合了 HCI Driver, Fast Parsing, Sync Logic
- * * 對應 Sender 結構:
- * [Type(1)][ID(2)][CMD(1)][Mask(8)][Delay(4)] = Total 16 bytes
- */
 
 #include "bt_receiver.h"
 #include <string.h>
@@ -35,26 +29,30 @@
 
 enum { H4_TYPE_COMMAND = 1, H4_TYPE_ACL = 2, H4_TYPE_SCO = 3, H4_TYPE_EVENT = 4 };
 
-// --- 內部資料結構 ---
-// typedef struct {
-//     uint8_t cmd_type;
-//     uint64_t target_mask;
-//     uint32_t delay_val;
-//     int8_t rssi;
-//     int64_t rx_time_us; 
-// } ble_rx_packet_t;
 
 static const char *TAG = "BT_RECEIVER";
 
-// 全域變數 (限制在此檔案內)
 static bt_receiver_config_t s_config;
 static QueueHandle_t s_adv_queue = NULL;
 static esp_timer_handle_t s_action_timer = NULL;
+static esp_timer_handle_t s_prep_timer = NULL;   // 負責關準備燈
 static TaskHandle_t s_task_handle = NULL;
 static bool s_is_running = false;
 static uint8_t hci_cmd_buf[128];
 static volatile bt_receiver_callback_t s_registered_callback = NULL;
 static volatile uint8_t s_pending_cmd = 0;
+
+// 指令代碼轉成字串(輸出用)
+static const char* cmd_to_str(bt_cmd_t cmd) {
+    switch (cmd) {
+        case BT_CMD_RESET: return "RESET"; 
+        case BT_CMD_READY: return "READY";
+        case BT_CMD_TEST:  return "TEST";
+        case BT_CMD_PLAY:  return "PLAY";
+        case BT_CMD_PAUSE: return "PAUSE";
+        default:           return "UNKNOWN";
+    }
+}
 
 // ==========================================
 // Part 1: HCI Helper Functions (Private)
@@ -121,7 +119,6 @@ while (offset < data_len) {
             if (ad_len == 0) break;
             uint8_t ad_type = adv_data[offset++];
 
-            // [修改] 長度檢查：從 16 改為 20
             // Type(1) + ID(2) + CMD(1) + Mask(8) + Delay(4) + Prep(4) = 20 bytes
             if (ad_type == 0xFF && ad_len >= 20) {
                 uint16_t target_id = s_config.manufacturer_id;
@@ -145,7 +142,7 @@ while (offset < data_len) {
                     }
 
                     if (is_target) {
-                        // GPIO Trigger (邏輯不變)
+                        // GPIO Trigger 
                         if (s_config.feedback_gpio_num >= 0) {
                             gpio_set_level(s_config.feedback_gpio_num, 1);
                             esp_rom_delay_us(1);
@@ -170,10 +167,10 @@ while (offset < data_len) {
 
                         // 填入結構
                         ble_rx_packet_t pkt;
-                        pkt.cmd_type = (bt_cmd_t)rcv_cmd; // 記得轉型
+                        pkt.cmd_type = (bt_cmd_t)rcv_cmd; 
                         pkt.target_mask = rcv_mask;
                         pkt.delay_val = rcv_delay;
-                        pkt.prep_led_us = rcv_prep; // [新增]
+                        pkt.prep_led_us = rcv_prep; 
                         pkt.rssi = rssi;
                         pkt.rx_time_us = now_us;
 
@@ -208,14 +205,25 @@ static esp_vhci_host_callback_t vhci_host_cb = { controller_rcv_pkt_ready, host_
 
 static void IRAM_ATTR timer_timeout_cb(void *arg) {
     if (s_registered_callback) {
-        s_registered_callback(s_pending_cmd);
+        s_registered_callback(s_pending_cmd, BT_TRIG_SYNC, 0);
+    }
+}
+
+// Prep Timer Callback (關準備燈)
+static void IRAM_ATTR prep_timer_timeout_cb(void *arg) {
+    if (s_registered_callback) {
+        // 傳遞 PREP_END 觸發
+        s_registered_callback(s_pending_cmd, BT_TRIG_PREP_END, 0);
     }
 }
 
 static void sync_process_task(void *arg) {
     ble_rx_packet_t pkt;
-    uint8_t current_cmd = 0;
-    uint8_t processed_cmd = 0; // 用來記錄這波是否已經設定過 Timer
+    bt_cmd_t current_cmd = BT_CMD_UNKNOWN;
+    bt_cmd_t processed_cmd = BT_CMD_UNKNOWN;
+    
+    uint32_t current_prep_us = 0; // 暫存 Prep 時間
+
     int64_t sum_target = 0;
     int count = 0;
     bool collecting = false;
@@ -224,23 +232,32 @@ static void sync_process_task(void *arg) {
     ESP_LOGI(TAG, "Sync Task Running...");
 
     while (s_is_running) {
-        // 從 Queue 讀取數據 (Timeout 10ms)
         if (xQueueReceive(s_adv_queue, &pkt, pdMS_TO_TICKS(10)) == pdTRUE) {
             int64_t now = esp_timer_get_time();
 
-            // 如果這個 CMD 還沒被最終鎖定過 (避免重複觸發)
             if (pkt.cmd_type != processed_cmd) {
                 // 偵測新 Burst (開始收集)
                 if (!collecting || pkt.cmd_type != current_cmd) {
-                    esp_timer_stop(s_action_timer); // 停止舊的 Timer
+                    
+                    // 收到新指令，先把兩個計時器都停掉 (避免舊的干擾)
+                    if (s_action_timer) esp_timer_stop(s_action_timer);
+                    if (s_prep_timer) esp_timer_stop(s_prep_timer);
+
                     collecting = true;
-                    current_cmd = pkt.cmd_type;
+                    current_cmd = (bt_cmd_t)pkt.cmd_type;
+                    current_prep_us = pkt.prep_led_us; // 抓取 Prep 時間
+                    
                     sum_target = 0;
                     count = 0;
                     window_start_time = now;
+
+                    // 立即觸發 IMMEDIATE (開準備燈)
+                    if (s_registered_callback) {
+                        s_registered_callback((uint8_t)current_cmd, BT_TRIG_IMMEDIATE, current_prep_us);
+                    }
                 }
 
-                // 收集樣本
+                // 收集封包
                 if (collecting && now < (window_start_time + s_config.sync_window_us)) {
                     sum_target += (pkt.rx_time_us + pkt.delay_val);
                     count++;
@@ -248,7 +265,7 @@ static void sync_process_task(void *arg) {
             }
         }
 
-        // 結算 (當收集狀態為 true 且 時間超過窗口)
+        // 結算
         if (collecting) {
             int64_t now = esp_timer_get_time();
             if (now >= (window_start_time + s_config.sync_window_us)) {
@@ -256,20 +273,30 @@ static void sync_process_task(void *arg) {
 
                 if (count > 0) {
                     int64_t final_target = sum_target / count;
-                    int64_t wait_us = final_target - now;
+                    int64_t wait_for_action = final_target - now;
 
-                    if (wait_us > 500) {
-                        s_pending_cmd = current_cmd;
-                        esp_timer_start_once(s_action_timer, wait_us);
-                        
-                        ESP_LOGI(TAG, "CMD 0x%02X Received! Count: %d | Target: %lld | Action in: %lld us", 
-                                 current_cmd, count, final_target, wait_us);
-                        
-                        // 標記為已處理，避免同一個 Command 重複鎖定
-                        processed_cmd = current_cmd;
+                    // window_start_time 近似於發送時間
+                    int64_t wait_for_prep = (window_start_time + current_prep_us) - now;
 
+                    s_pending_cmd = (uint8_t)current_cmd;
+                    processed_cmd = current_cmd; 
+
+                    // 1. 設定 Action Timer (主動作)
+                    if (wait_for_action > 500) {
+                        esp_timer_start_once(s_action_timer, wait_for_action);
+                        ESP_LOGI(TAG, "CMD: [%s] Action in: %lld us", cmd_to_str(current_cmd), wait_for_action);
                     } else {
-                        ESP_LOGW(TAG, "CMD 0x%02X Missed! Latency too high.", current_cmd);
+                        ESP_LOGW(TAG, "CMD Missed! [%s] Latency too high.", cmd_to_str(current_cmd));
+                    }
+
+                    // 2. 設定 Prep Timer (關燈)
+                    if (current_cmd == BT_CMD_PLAY &&     
+                        current_prep_us > 0 && 
+                        wait_for_prep > 1000 && 
+                        wait_for_prep < wait_for_action) {
+                        
+                        esp_timer_start_once(s_prep_timer, wait_for_prep);
+                        ESP_LOGI(TAG, "Prep Timer Set: %lld us", wait_for_prep);
                     }
                 }
             }
@@ -286,7 +313,7 @@ esp_err_t bt_receiver_init(const bt_receiver_config_t *config) {
     if (!config) return ESP_ERR_INVALID_ARG;
     s_config = *config;
 
-    // 1. Create Queue
+   // 1. Create Queue
     s_adv_queue = xQueueCreate(s_config.queue_size, sizeof(ble_rx_packet_t));
     if (!s_adv_queue) return ESP_ERR_NO_MEM;
 
@@ -307,12 +334,20 @@ esp_err_t bt_receiver_init(const bt_receiver_config_t *config) {
     esp_bt_controller_enable(ESP_BT_MODE_BLE);
     esp_vhci_host_register_callback(&vhci_host_cb);
 
-    // 4. Create Timer
-    esp_timer_create_args_t timer_args = {
+    // 4. Create Timers
+    // Action Timer
+    esp_timer_create_args_t action_timer_args = {
         .callback = &timer_timeout_cb,
-        .name = "bt_rx_trigger"
+        .name = "bt_action_timer"
     };
-    esp_timer_create(&timer_args, &s_action_timer);
+    esp_timer_create(&action_timer_args, &s_action_timer);
+
+    // Prep Timer
+    esp_timer_create_args_t prep_timer_args = {
+        .callback = &prep_timer_timeout_cb,
+        .name = "bt_prep_timer"
+    };
+    esp_timer_create(&prep_timer_args, &s_prep_timer);
 
     return ESP_OK;
 }
@@ -354,6 +389,7 @@ esp_err_t bt_receiver_stop(void) {
     
     // Stop Timer
     if (s_action_timer) esp_timer_stop(s_action_timer);
+    if (s_prep_timer) esp_timer_stop(s_prep_timer); 
     
     return ESP_OK;
 }
