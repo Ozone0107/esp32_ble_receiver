@@ -8,16 +8,25 @@
 extern "C" {
 #endif
 
+typedef enum {
+    BT_CMD_RESET = 0x01,
+    BT_CMD_READY = 0x02,
+    BT_CMD_TEST  = 0x03,
+    BT_CMD_PLAY  = 0xA0,
+    BT_CMD_PAUSE = 0xA1,
+    BT_CMD_UNKNOWN = 0xFF
+} bt_cmd_t;
+
 //typedef void (*bt_receiver_callback_t)(void);
 typedef void (*bt_receiver_callback_t)(uint8_t cmd);
 
-// --- [修改] 接收到的封包結構 ---
 typedef struct {
-    uint8_t cmd_type;
-    uint64_t target_mask; // 新增：8 bytes 的玩家遮罩
-    uint32_t delay_val;
-    int8_t rssi;
-    int64_t rx_time_us; 
+    bt_cmd_t cmd_type;     // 指令類型
+    uint64_t target_mask;  // 目標遮罩
+    uint32_t delay_val;    // 延遲執行時間
+    uint32_t prep_led_us;  // [新增] 預備燈號時間
+    int8_t rssi;           // 訊號強度
+    int64_t rx_time_us;    // 接收時間戳
 } ble_rx_packet_t;
 
 // --- [修改] 初始化設定 ---

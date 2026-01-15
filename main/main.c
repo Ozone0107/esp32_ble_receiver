@@ -12,29 +12,24 @@
 static const char *TAG = "APP_MAIN";
 
 #define ACTION_GPIO 2
-#define STATE_RESET   0x01
-#define STATE_READY   0x02
-#define STATE_PLAY    0x03
-#define STATE_TEST    0x04
-#define STATE_PAUSE   0x05
 
 static void IRAM_ATTR state_action_callback(uint8_t cmd) {
     
-    // 使用 switch-case 判斷收到什麼，並印出對應訊息
+    // 直接使用 bt_receiver.h 裡定義的 Enum
     switch (cmd) {
-        case STATE_RESET:
+        case BT_CMD_RESET:
             ESP_LOGI(TAG, ">>> [收到指令] RESET");
             break;
-        case STATE_READY:
+        case BT_CMD_READY:
             ESP_LOGI(TAG, ">>> [收到指令] READY");
             break;
-        case STATE_PLAY:
+        case BT_CMD_PLAY:
             ESP_LOGI(TAG, ">>> [收到指令] PLAY");
             break;
-        case STATE_TEST:
+        case BT_CMD_TEST:
             ESP_LOGI(TAG, ">>> [收到指令] TEST");
             break;
-        case STATE_PAUSE:
+        case BT_CMD_PAUSE:
             ESP_LOGI(TAG, ">>> [收到指令] PAUSE");
             break;
         default:
@@ -43,7 +38,7 @@ static void IRAM_ATTR state_action_callback(uint8_t cmd) {
     }
 }
 // 測試用的 Callback：閃爍 LED
-static void IRAM_ATTR led_blink_action(void) {
+static void IRAM_ATTR led_blink_action(uint8_t cmd) {
     static int level = 0;
     gpio_set_level(ACTION_GPIO, level = !level);
     // 這裡通常是 Player Task 的通知入口
@@ -78,8 +73,8 @@ void app_main(void) {
 
     // 3. 註冊動作
     // 設定當 Target Time 到達時，要執行什麼動作
-    bt_receiver_register_callback(state_action_callback);
-
+    //bt_receiver_register_callback(state_action_callback);
+    bt_receiver_register_callback(led_blink_action);
     // 讓 Main Loop 保持活躍
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));

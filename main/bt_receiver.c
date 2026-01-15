@@ -116,70 +116,75 @@ static void IRAM_ATTR fast_parse_and_trigger(uint8_t *data, uint16_t len) {
         int8_t rssi = payload[9 + data_len];
 
         uint8_t offset = 0;
-        while (offset < data_len) {
+while (offset < data_len) {
             uint8_t ad_len = adv_data[offset++];
             if (ad_len == 0) break;
             uint8_t ad_type = adv_data[offset++];
 
-            // [修改] 長度檢查：
-            // Type(1) + ID(2) + CMD(1) + Mask(8) + Delay(4) = 16 bytes
-            // ad_len 包含 Type 欄位本身(1) + Data(15) = 16
-            if (ad_type == 0xFF && ad_len >= 16) {
+            // [修改] 長度檢查：從 16 改為 20
+            // Type(1) + ID(2) + CMD(1) + Mask(8) + Delay(4) + Prep(4) = 20 bytes
+            if (ad_type == 0xFF && ad_len >= 20) {
                 uint16_t target_id = s_config.manufacturer_id;
                 
-                // 檢查 Manufacturer ID (Offset 0, 1) - Little Endian in Packet
+                // 檢查 Manufacturer ID (Offset 0, 1)
                 if (adv_data[offset] == (target_id & 0xFF) && 
                     adv_data[offset+1] == ((target_id >> 8) & 0xFF)) {
                     
-                    // [新增] 解析 8-byte Target Mask (Offset 3 ~ 10)
-                    // Sender 寫入順序是 Little Endian (Byte 0 ... Byte 7)
+                    // 解析 Mask (Offset 3 ~ 10)
                     uint64_t rcv_mask = 0;
                     for(int k=0; k<8; k++) {
                         rcv_mask |= ((uint64_t)adv_data[offset + 3 + k] << (k*8));
                     }
 
-                    // [新增] 檢查我是否在目標名單中
+                    // 檢查 Target ID (邏輯不變)
                     bool is_target = true;
                     if (s_config.my_player_id >= 0) {
-                        // 檢查 Mask 對應 bit 是否為 1
                         if (!((rcv_mask >> s_config.my_player_id) & 1ULL)) {
                             is_target = false;
                         }
                     }
 
                     if (is_target) {
-                        // Hardware Trigger (GPIO Debug) - 符合資格才觸發
+                        // GPIO Trigger (邏輯不變)
                         if (s_config.feedback_gpio_num >= 0) {
                             gpio_set_level(s_config.feedback_gpio_num, 1);
                             esp_rom_delay_us(1);
                             gpio_set_level(s_config.feedback_gpio_num, 0);
                         }
 
-                        // [修改] 解析 CMD (Offset 2)
+                        // 解析 CMD (Offset 2)
                         uint8_t rcv_cmd = adv_data[offset+2];
 
-                        // [修改] 解析 Delay (Offset 11 ~ 14) - Big Endian
+                        // 解析 Delay (Offset 11 ~ 14) - Big Endian
                         uint32_t rcv_delay = (adv_data[offset+11] << 24) |
                                              (adv_data[offset+12] << 16) |
                                              (adv_data[offset+13] << 8)  |
                                              (adv_data[offset+14]);
 
+                        // [新增] 解析 Prep LED Time (Offset 15 ~ 18) - Big Endian
+                        // Sender 寫入順序: MSB 在前 (>>24 先寫入)
+                        uint32_t rcv_prep = (adv_data[offset+15] << 24) |
+                                            (adv_data[offset+16] << 16) |
+                                            (adv_data[offset+17] << 8)  |
+                                            (adv_data[offset+18]);
+
+                        // 填入結構
                         ble_rx_packet_t pkt;
-                        pkt.cmd_type = rcv_cmd;
+                        pkt.cmd_type = (bt_cmd_t)rcv_cmd; // 記得轉型
                         pkt.target_mask = rcv_mask;
                         pkt.delay_val = rcv_delay;
+                        pkt.prep_led_us = rcv_prep; // [新增]
                         pkt.rssi = rssi;
                         pkt.rx_time_us = now_us;
 
                         BaseType_t xHigherPriorityTaskWoken = pdFALSE;
                         xQueueSendFromISR(s_adv_queue, &pkt, &xHigherPriorityTaskWoken);
                         
-                        // 正確的 portYIELD_FROM_ISR 用法
                         if (xHigherPriorityTaskWoken) {
                             portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
                         }
                         
-                        return; // 找到並處理完畢，跳出
+                        return; 
                     }
                 }
             }
@@ -257,7 +262,7 @@ static void sync_process_task(void *arg) {
                         s_pending_cmd = current_cmd;
                         esp_timer_start_once(s_action_timer, wait_us);
                         
-                        ESP_LOGI(TAG, "CMD 0x%02X Locked! Count: %d | Target: %lld | Action in: %lld us", 
+                        ESP_LOGI(TAG, "CMD 0x%02X Received! Count: %d | Target: %lld | Action in: %lld us", 
                                  current_cmd, count, final_target, wait_us);
                         
                         // 標記為已處理，避免同一個 Command 重複鎖定
