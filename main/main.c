@@ -59,7 +59,7 @@ static void IRAM_ATTR state_action_callback(uint8_t cmd_raw, bt_trigger_t trigge
     }
 }
 // 測試用：閃爍 LED
-static void IRAM_ATTR led_blink_action(uint8_t cmd) {
+static void IRAM_ATTR led_blink_action(uint8_t cmd_raw, bt_trigger_t trigger, uint32_t val) {
     static int level = 0;
     gpio_set_level(ACTION_GPIO, level = !level);
 
