@@ -99,6 +99,7 @@ static uint16_t make_cmd_ble_set_scan_enable (uint8_t *buf, uint8_t scan_enable,
 // Part 2: Fast RX Driver & ISR
 // ==========================================
 
+//確認與解析封包
 static void IRAM_ATTR fast_parse_and_trigger(uint8_t *data, uint16_t len) {
     int64_t now_us = esp_timer_get_time();
 
@@ -217,6 +218,7 @@ static void IRAM_ATTR prep_timer_timeout_cb(void *arg) {
     }
 }
 
+//以收到的封包算出開始時間
 static void sync_process_task(void *arg) {
     ble_rx_packet_t pkt;
     bt_cmd_t current_cmd = BT_CMD_UNKNOWN;
